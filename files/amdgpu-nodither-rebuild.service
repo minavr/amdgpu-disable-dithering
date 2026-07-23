@@ -1,0 +1,17 @@
+[Unit]
+Description=Ensure dither-disabled amdgpu is installed for the running kernel
+Documentation=file:///usr/local/share/amdgpu-nodither/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/sbin/amdgpu-nodither-rebuild.sh
+
+[Service]
+Type=oneshot
+# Idempotent: exits immediately if the running kernel's amdgpu is already patched.
+ExecStart=/usr/local/sbin/amdgpu-nodither-rebuild.sh
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=2400
+
+[Install]
+WantedBy=multi-user.target

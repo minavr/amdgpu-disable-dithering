@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=amdgpu dither-patch check
+Comment=Warn if the running amdgpu driver is not the dither-disabled build
+Exec=/usr/local/sbin/amdgpu-nodither-check.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
