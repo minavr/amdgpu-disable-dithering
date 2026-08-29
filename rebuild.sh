@@ -18,6 +18,11 @@
 #   - verifies vermagic + patch marker before installing, backs up stock module.
 #
 # --build-only : compile + verify only; no signing, no install, no root needed.
+# --force      : rebuild even if the installed module already looks patched.
+#
+# Verification before install: vermagic, patch marker AND the
+# .gnu.linkonce.this_module relocation offsets vs the stock module (catches a
+# struct-module layout mismatch, which makes the kernel refuse the module).
 #
 set -uo pipefail
 
@@ -25,9 +30,32 @@ log()  { echo "[amdgpu-nodither] $*"; }
 die()  { echo "[amdgpu-nodither] ERROR: $*" >&2; exit 1; }
 softfail() { echo "[amdgpu-nodither] SOFT-FAIL: $*" >&2; exit 0; }
 
-BUILD_ONLY=0; KVER=""
+# Fingerprint of .gnu.linkonce.this_module relocations (offset + symbol).
+# These offsets ARE the struct-module layout the module was compiled against.
+# If they differ from the stock module's, the running kernel refuses the
+# relocation ("Invalid relocation target, existing value is nonzero") and the
+# module never loads -> no GPU driver.  Accepts .ko or (any-named) zstd file.
+this_module_relocs() {
+  local f="$1" tmp out
+  [ -f "$f" ] || return 1
+  tmp="$(mktemp)" || return 1
+  if [ "$(head -c4 "$f" | od -An -tx1 | tr -d ' \n')" = "28b52ffd" ]; then
+    zstd -dqc "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  else
+    cat "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  out="$(readelf -r -W "$tmp" 2>/dev/null | awk '
+      /\.rela\.gnu\.linkonce\.this_module/ {p=1; next}
+      p && /^$/ {exit}
+      p && /R_X86_64/ {print $1, $5}' | sort | tr '\n' ';')"
+  rm -f "$tmp"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+BUILD_ONLY=0; FORCE=0; KVER=""
 for a in "$@"; do case "$a" in
-  --build-only) BUILD_ONLY=1 ;; *) KVER="$a" ;;
+  --build-only) BUILD_ONLY=1 ;; --force) FORCE=1 ;; *) KVER="$a" ;;
 esac; done
 [ -n "$KVER" ] || KVER="$(uname -r)"
 
@@ -55,8 +83,21 @@ if grep -q '^CONFIG_GCC_PLUGIN_RANDSTRUCT=y\|^CONFIG_RANDSTRUCT_FULL=y' "$KDIR/.
 fi
 
 # --- already patched? -----------------------------------------------------
-if [ -f "$MODREL" ] && [ "$(modinfo -F frc_dither "$MODREL" 2>/dev/null)" = "disabled" ]; then
-  log "amdgpu for $KVER is already patched — nothing to do."; exit 0
+if [ "$FORCE" -eq 0 ] && [ -f "$MODREL" ] \
+   && [ "$(modinfo -F frc_dither "$MODREL" 2>/dev/null)" = "disabled" ]; then
+  # "patched" is not enough: verify it can actually be relocated by this
+  # kernel, otherwise we would keep a dead driver forever (boot fallback
+  # included) and the machine falls back to simpledrm @ 1024x768.
+  INST_R="$(this_module_relocs "$MODREL")"
+  REF_R="$(this_module_relocs "$MODREL.stock-orig")"
+  if [ -n "$INST_R" ] && [ -n "$REF_R" ] && [ "$INST_R" != "$REF_R" ]; then
+    log "installed patched module has a MISMATCHED struct-module layout"
+    log "  installed: $INST_R"
+    log "  stock    : $REF_R"
+    log "-> it cannot load on this kernel; rebuilding."
+  else
+    log "amdgpu for $KVER is already patched — nothing to do."; exit 0
+  fi
 fi
 
 # --- upstream base version from the kernel's own Makefile -----------------
@@ -129,6 +170,25 @@ echo "$BUILT_VM" | grep -q modversions || die "vermagic missing modversions"
 
 strip --strip-debug "$MODOUT" || die "strip failed"
 [ "$(modinfo -F frc_dither "$MODOUT")" = "disabled" ] || die "marker lost after strip"
+
+# struct-module layout must match the stock module bit for bit, else the
+# kernel rejects the relocation at load time and we end up with no driver.
+REF=""
+for r in "$MODREL.stock-orig" "$MODREL"; do
+  [ -f "$r" ] && [ "$(modinfo -F frc_dither "$r" 2>/dev/null)" != "disabled" ] && REF="$r" && break
+done
+if [ -n "$REF" ]; then
+  BUILT_R="$(this_module_relocs "$MODOUT")"; REF_R="$(this_module_relocs "$REF")"
+  [ -n "$BUILT_R" ] && [ -n "$REF_R" ] || die "cannot read this_module relocations (readelf/zstd missing?)"
+  if [ "$BUILT_R" != "$REF_R" ]; then
+    log "built  : $BUILT_R"
+    log "stock  : $REF_R"
+    die "struct-module layout differs from stock ($REF) — the kernel would refuse to load this module; NOT installing."
+  fi
+  log "struct-module relocation layout matches stock: $BUILT_R"
+else
+  log "WARNING: no unpatched reference module found — layout check skipped."
+fi
 log "vermagic + marker OK, stripped -> $(du -h "$MODOUT" | cut -f1)."
 
 if [ "$BUILD_ONLY" -eq 1 ]; then

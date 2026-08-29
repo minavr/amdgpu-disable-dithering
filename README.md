@@ -22,7 +22,7 @@ configuration:
 |---|---|
 | GPU | AMD Radeon **RX 6700** (Navi 22, **RDNA2**), driver `amdgpu` |
 | Distro | **Ubuntu 24.04.4 LTS** (noble) |
-| Kernel | **7.0.0-28-generic** (HWE stack; upstream base 7.0.12) |
+| Kernel | **7.0.0-28-generic** (HWE stack; upstream base 7.0.12) — also in use on `7.0.0-29` and `7.0.0-30` |
 | Display | HDMI to a TV, **X11** (XFCE) |
 | Secure Boot | **Enabled** (module must be MOK‑signed) |
 
@@ -278,11 +278,11 @@ These automate everything above for the tested Ubuntu config:
 | file | purpose |
 |---|---|
 | [`amdgpu-nodither.patch`](amdgpu-nodither.patch) | the source patch |
-| [`rebuild.sh`](rebuild.sh) | download source, patch, build against KDIR, verify `vermagic`+marker, sign, install. `--build-only` compiles without installing |
+| [`rebuild.sh`](rebuild.sh) | download source, patch, build against KDIR, verify `vermagic` + marker + **`struct module` relocation layout**, sign, install. `--build-only` compiles without installing; `--force` rebuilds even when the installed module already looks patched |
 | [`setup.sh`](setup.sh) | one‑time installer: build deps, MOK, automation, first build |
 | [`files/zz-amdgpu-nodither`](files/zz-amdgpu-nodither) | `/etc/kernel/postinst.d/` hook — rebuilds the patched module for every newly installed kernel |
 | [`files/amdgpu-nodither-rebuild.service`](files/amdgpu-nodither-rebuild.service) | boot‑time fallback that rebuilds if the running kernel is unpatched |
-| [`files/amdgpu-nodither-check.*`](files/) | desktop notification if the running `amdgpu` is ever *not* the patched build |
+| [`files/amdgpu-nodither-check.*`](files/) | desktop notification if `amdgpu` fails to load at all, or if the running driver is *not* the patched build |
 
 ### Persistence across kernel updates
 
@@ -293,14 +293,38 @@ kernel is installed (log: `/var/log/amdgpu-nodither.log`). The boot service and
 the desktop check are a safety net: if a rebuild ever fails, you get a visible
 warning instead of a silent return of the flicker.
 
+### Updating an existing install
+
+The scripts run from `/usr/local/sbin/`, **not** from your clone — the kernel
+hook calls `/usr/local/sbin/amdgpu-nodither-rebuild.sh`. Pulling a new version
+of this repo therefore changes nothing until you redeploy it:
+
+```bash
+git pull
+sudo bash setup.sh --no-build        # redeploys the scripts to /usr/local/sbin
+sudo amdgpu-nodither-rebuild.sh --force
+sudo reboot
+```
+
+Skipping the redeploy is exactly how the failure described in
+[Post-mortem](#post-mortem-a-kernel-update-left-the-machine-at-1024x768) happened:
+a fixed `rebuild.sh` sat in the clone for weeks while the kernel hook kept
+running the old, broken one.
+
 ---
 
 ## Verifying it worked
 
 ```bash
-[ -d /sys/module/amdgpu ] && echo loaded          # driver is up
+# the driver is actually driving a display (not just present as a file):
+readlink -f /sys/class/drm/card*/device/driver     # .../drivers/amdgpu
 modinfo -F frc_dither amdgpu                       # disabled
+xrandr | head -3                                   # your real resolution
 ```
+
+> `modinfo` reads the module **file on disk**, so it prints `disabled` even when
+> no driver is loaded at all. Always check the DRM binding too — that is the one
+> test that distinguishes "patched and running" from "patched and dead".
 
 The technical checks only prove the *patched code* is running. The decisive test
 is subjective: after normal use, is the eye strain / fatigue / nausea gone?
@@ -334,6 +358,9 @@ sudo systemctl disable --now amdgpu-nodither-rebuild.service
 
 * **`Exec format error` / `Invalid relocation target`** on load → you built
   against a standalone tree; build against `/lib/modules/$(uname -r)/build`.
+  This is the nastiest one: the build, the signature and `vermagic` all look
+  fine, and the module only dies at load time — see
+  [Post-mortem](#post-mortem-a-kernel-update-left-the-machine-at-1024x768).
 * **`fatal error: dwarf.h`** during `modules_prepare`/build → install `libdw-dev`.
 * **Trace include not found**, or path mangled to `1-<ver>` → fix
   `TRACE_INCLUDE_PATH` and use a source dir without the token `linux`.
@@ -341,6 +368,62 @@ sudo systemctl disable --now amdgpu-nodither-rebuild.service
   yet; enroll it (MOK Manager) before relying on the module.
 * **`modprobe` succeeds at boot but `/sys/module/amdgpu` is missing** → the
   module loaded then failed init; almost always the relocation issue above.
+
+---
+
+## Post-mortem: a kernel update left the machine at 1024x768
+
+A real failure from this setup, worth reading before you trust any automation
+of your own.
+
+**Symptom.** After a routine `apt upgrade` (kernel `7.0.0-28` → `7.0.0-29`) the
+desktop came up at **1024×768** and refused every other mode — and stayed that
+way across reboots for three days. The GPU was fine; `amdgpu` simply never
+loaded, so the display fell back to `simpledrm` on the EFI framebuffer:
+
+```console
+$ journalctl -k -b | grep -iE 'amdgpu|relocation'
+module: x86/modules: Invalid relocation target, existing value is nonzero
+```
+
+**Cause.** A fixed `rebuild.sh` (the KDIR build described above) existed only in
+the working copy and had **never been copied to `/usr/local/sbin/`**. So when
+the kernel hook fired for the new kernel, it rebuilt the module with the old
+standalone‑tree method → the binary carried a different `struct module` layout
+than the running kernel expects → the loader rejected it.
+
+The layout difference is directly visible in the module's relocations:
+
+```bash
+readelf -r -W amdgpu.ko | grep -A5 gnu.linkonce.this_module   # broken vs. .stock-orig
+#  broken build:  cleanup_module @ 0x490
+#  stock module:  cleanup_module @ 0x4a8
+```
+
+**Why nothing warned.** All three safety nets were blind in the same way — they
+tested the module *file*, never the *running* driver:
+
+1. `rebuild.sh` saw `frc_dither=disabled` on disk → "already patched, nothing to
+   do" → the boot service's retry did nothing either, forever.
+2. The kernel hook's rebuild reported success — the module built and signed
+   cleanly; the defect only appears at load time.
+3. `amdgpu-nodither-check.sh` tested `modinfo -F frc_dither amdgpu`, which reads
+   that same file on disk, so it stayed quiet while there was no driver at all.
+
+**Fixes now in this repo.**
+
+* `rebuild.sh` compares the `.gnu.linkonce.this_module` relocation offsets of
+  the module it just built against the stock module, and **refuses to install**
+  on a mismatch — a missing driver is far worse than a dithering one.
+* The same comparison runs in the "already patched" shortcut, so a module that
+  cannot load triggers a rebuild instead of "nothing to do".
+* `rebuild.sh --force` skips that shortcut entirely.
+* `amdgpu-nodither-check.sh` first checks whether `amdgpu` is bound to a DRM
+  card, and shouts if the driver never loaded.
+
+**The general lesson:** a check that reads an artefact on disk proves only that
+the artefact exists. If what you care about is a *running* component, test the
+running component.
 
 ---
 
