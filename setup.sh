@@ -27,7 +27,7 @@ BUILD=1
 echo "== 1/6 build dependencies =="
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y --no-install-recommends \
-  build-essential flex bison libssl-dev libelf-dev libdw-dev bc zstd curl xz-utils \
+  build-essential flex bison libssl-dev libelf-dev libdw-dev bc zstd curl xz-utils bzip2 \
   mokutil libnotify-bin
 
 echo "== 2/6 install scripts & assets =="
