@@ -21,8 +21,8 @@ configuration:
 | | |
 |---|---|
 | GPU | AMD Radeon **RX 6700** (Navi 22, **RDNA2**), driver `amdgpu` |
-| Distro | **Ubuntu 24.04.4 LTS** (noble) |
-| Kernel | **7.0.0-28-generic** (HWE stack; upstream base 7.0.12) — also in use on `7.0.0-29` and `7.0.0-30` |
+| Distro | **Ubuntu 24.04.4 LTS** (noble), later upgraded to **Ubuntu 26.04.1 LTS** (resolute) |
+| Kernel | **7.0.0-28-generic** (HWE stack; upstream base 7.0.12) — also in use on `7.0.0-29` … `7.0.0-38` |
 | Display | HDMI to a TV, **X11** (XFCE) |
 | Secure Boot | **Enabled** (module must be MOK‑signed) |
 
@@ -90,6 +90,10 @@ $ modinfo -F frc_dither amdgpu
 disabled
 ```
 
+A second marker records which source the module was built from, e.g.
+`modinfo -F nodither_src amdgpu` → `ubuntu-7.0.0-38.38` (see
+[Use the distro's kernel source](#use-the-distros-kernel-source-not-kernelorg)).
+
 ---
 
 ## The critical build detail (why naive builds fail)
@@ -134,6 +138,29 @@ Two gotchas when building the in‑tree `amdgpu` driver out‑of‑tree:
 
 Both are handled automatically by [`rebuild.sh`](rebuild.sh).
 
+### Use the distro's kernel source, not kernel.org
+
+The module you build **replaces the distro's `amdgpu` wholesale**, so its source
+must be the distro's source for that exact kernel package — not the upstream
+stable tarball whose version the headers' `Makefile` names.
+
+Ubuntu stops bumping `SUBLEVEL` at some point and keeps backporting fixes on
+top (on 7.0 the `Makefile` said `7.0.14` from `7.0.0-31` through `7.0.0-38`,
+while Ubuntu kept pulling fixes from 6.18.y / 7.1.y). A vanilla `7.0.14` build
+compiles and loads perfectly, yet silently drops every one of those fixes —
+about 90 `drm/amd` changes by `7.0.0-38`, including one whose absence froze the
+machine (see [Post-mortem](#post-mortem-vanilla-source-dropped-a-distro-fix--frozen-machine)).
+To see what your distro adds:
+
+```bash
+zcat /usr/share/doc/linux-modules-$(uname -r)/changelog.Debian.gz | grep -E '^\s+- drm/amd'
+```
+
+[`rebuild.sh`](rebuild.sh) therefore fetches Ubuntu's `linux-source-X.Y.Z`
+package **in the exact version of the installed kernel package** with
+`apt-get download` (download only, no install — so it also works inside the
+apt kernel hook) and builds from the tarball inside it.
+
 ---
 
 ## Quick start (Ubuntu, the tested path)
@@ -172,7 +199,7 @@ echo "$XDG_SESSION_TYPE"                   # x11 / wayland
 
 ```bash
 sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev \
-    libdw-dev bc zstd curl xz-utils mokutil libnotify-bin
+    libdw-dev bc zstd curl xz-utils bzip2 mokutil libnotify-bin
 ```
 
 * `libdw-dev` is required — without it the kernel's `gendwarfksyms` tool
@@ -180,27 +207,29 @@ sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev \
 * You also need the **matching kernel headers**: `linux-headers-$(uname -r)`
   (the tested machine had them via `linux-headers-generic-hwe-24.04`).
 
-### 3. Get the kernel source matching your running kernel
+### 3. Get the distro's kernel source for your exact kernel
 
-Ubuntu's HWE kernel tracks an upstream stable base; read it from the headers'
-`Makefile` and download that tarball:
+Use the source of the very kernel package you are running — **not** the
+kernel.org tarball named by the headers' `Makefile` (that one lacks the
+distro's backported fixes; see
+[Use the distro's kernel source](#use-the-distros-kernel-source-not-kernelorg)).
+On Ubuntu it ships as the `linux-source-X.Y.Z` package:
 
 ```bash
-KDIR=/lib/modules/$(uname -r)/build
-V=$(awk -F'= *' '/^VERSION/{print $2}'    $KDIR/Makefile)
-P=$(awk -F'= *' '/^PATCHLEVEL/{print $2}' $KDIR/Makefile)
-S=$(awk -F'= *' '/^SUBLEVEL/{print $2}'   $KDIR/Makefile)
-BASE="$V.$P.$S"                    # e.g. 7.0.12
-curl -fLO "https://cdn.kernel.org/pub/linux/kernel/v${V}.x/linux-$BASE.tar.xz"
-mkdir ksrc-build && tar -C ksrc-build -xf linux-$BASE.tar.xz
-mv ksrc-build/linux-$BASE ksrc-build/ksrc     # dir name WITHOUT the token "linux"
-cd ksrc-build/ksrc
+KREL=$(uname -r)                                         # e.g. 7.0.0-38-generic
+PKGVER=$(dpkg-query -W -f='${Version}' linux-modules-$KREL)   # e.g. 7.0.0-38.38
+SRCPKG=linux-source-${KREL%%-*}                          # e.g. linux-source-7.0.0
+mkdir ksrc-build && cd ksrc-build
+apt-get download "$SRCPKG=$PKGVER"                       # download only, ~200 MB
+dpkg-deb --fsys-tarfile ${SRCPKG}_*.deb \
+    | tar -xO ./usr/src/$SRCPKG/$SRCPKG.tar.bz2 > src.tar.bz2
+tar -xf src.tar.bz2
+mv $SRCPKG ksrc                    # dir name WITHOUT the token "linux"
+cd ksrc
 ```
 
-> If your distro applies large out‑of‑tree changes to the AMD driver you may
-> instead need the distro's own kernel source (e.g. `apt-get source`). On the
-> tested Ubuntu HWE kernel the upstream stable source compiled cleanly against
-> the distro headers.
+> Other distros: use their equivalent (e.g. `apt-get source`, a source RPM),
+> always in the version that exactly matches the installed kernel.
 
 ### 4. Apply the patch (+ marker)
 
@@ -278,11 +307,11 @@ These automate everything above for the tested Ubuntu config:
 | file | purpose |
 |---|---|
 | [`amdgpu-nodither.patch`](amdgpu-nodither.patch) | the source patch |
-| [`rebuild.sh`](rebuild.sh) | download source, patch, build against KDIR, verify `vermagic` + marker + **`struct module` relocation layout**, sign, install. `--build-only` compiles without installing; `--force` rebuilds even when the installed module already looks patched |
+| [`rebuild.sh`](rebuild.sh) | fetch **Ubuntu's source for the exact kernel package**, patch, build against KDIR, verify `vermagic` + markers + **`struct module` relocation layout**, sign, install. `--build-only` compiles without installing; `--force` rebuilds even when the installed module already looks patched; `--vanilla` is a last-resort kernel.org build (not recommended) |
 | [`setup.sh`](setup.sh) | one‑time installer: build deps, MOK, automation, first build |
 | [`files/zz-amdgpu-nodither`](files/zz-amdgpu-nodither) | `/etc/kernel/postinst.d/` hook — rebuilds the patched module for every newly installed kernel |
 | [`files/amdgpu-nodither-rebuild.service`](files/amdgpu-nodither-rebuild.service) | boot‑time fallback that rebuilds if the running kernel is unpatched |
-| [`files/amdgpu-nodither-check.*`](files/) | desktop notification if `amdgpu` fails to load at all, or if the running driver is *not* the patched build |
+| [`files/amdgpu-nodither-check.*`](files/) | desktop notification if `amdgpu` fails to load at all, if the running driver is *not* the patched build, or if it was built from vanilla instead of distro source |
 
 ### Persistence across kernel updates
 
@@ -368,6 +397,10 @@ sudo systemctl disable --now amdgpu-nodither-rebuild.service
   yet; enroll it (MOK Manager) before relying on the module.
 * **`modprobe` succeeds at boot but `/sys/module/amdgpu` is missing** → the
   module loaded then failed init; almost always the relocation issue above.
+* **Kernel oopses inside `amdgpu` (e.g. `amdgpu_hmm_invalidate_gfx`), a slowly
+  freezing machine** → the module was built from kernel.org source and lacks
+  the distro's fixes; rebuild from the distro source — see
+  [Post-mortem](#post-mortem-vanilla-source-dropped-a-distro-fix--frozen-machine).
 
 ---
 
@@ -424,6 +457,63 @@ tested the module *file*, never the *running* driver:
 **The general lesson:** a check that reads an artefact on disk proves only that
 the artefact exists. If what you care about is a *running* component, test the
 running component.
+
+---
+
+## Post-mortem: vanilla source dropped a distro fix → frozen machine
+
+**Symptom.** After about three weeks of uptime on Ubuntu kernel `7.0.0-38` the
+machine froze progressively (container health checks timing out, `logind`
+timeouts, unresponsive desktop) and needed a hard reset. The journal held four
+identical oopses over two days, the first one in `kcompactd0` and the later
+ones in game threads:
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000000
+RIP: 0010:amdgpu_hmm_invalidate_gfx+0x42/0xe0 [amdgpu]
+Call Trace:
+ __mmu_notifier_invalidate_range_start
+ try_to_migrate_one … migrate_pages … compact_zone
+ __alloc_pages_direct_compact … do_huge_pmd_anonymous_page
+```
+
+Memory compaction migrates a page that belongs to a GPU userptr buffer → the
+MMU notifier calls into `amdgpu` → NULL dereference. The oops kills the task
+while it holds memory-management locks, so every other task that needs them
+blocks too, and the machine grinds to a halt.
+
+**Cause.** `rebuild.sh` took the source from the kernel.org tarball named by
+the headers' `Makefile` (`7.0.14`). Vanilla `7.0.14` dereferences
+`bo->vm_bo->vm->root.bo` in `amdgpu_hmm_invalidate_gfx()` without checking
+`vm_bo` (introduced in 7.0.12 by *"drm/amdgpu: fix calling VM invalidation in
+amdgpu_hmm_invalidate_gfx"*). Ubuntu's `7.0.0-38` carries the follow-up
+*"drm/amdgpu: fix check in amdgpu_hmm_invalidate_gfx"*, and the disassembly of
+the stock module confirms it never touches `vm_bo` there. The patched module
+had silently thrown that fix away, along with about 90 other `drm/amd` fixes
+Ubuntu had added since `7.0.14`, because Ubuntu never bumped `SUBLEVEL` while
+backporting them.
+
+**Why nothing warned.** Every check passed: `vermagic`, the patch marker, the
+`struct module` relocation layout. They all prove that the module *fits* the
+kernel, not that its *source* matches the module it replaced.
+
+**Fixes now in this repo.**
+
+* `rebuild.sh` builds from Ubuntu's `linux-source-X.Y.Z` in the exact version
+  of the installed kernel package (`apt-get download`; no install, so it is
+  safe inside the apt hook). If that source can't be fetched it soft-fails and
+  leaves the stock module in place; the boot service retries later.
+* A `MODULE_INFO(nodither_src, "ubuntu-<pkgver>")` marker. The "already
+  patched" shortcut rebuilds whenever it doesn't match, so an existing vanilla
+  build is replaced automatically on the next run (boot service, kernel hook,
+  or `sudo amdgpu-nodither-rebuild.sh`).
+* `amdgpu-nodither-check.sh` warns when the module wasn't built from the distro
+  source.
+* The kernel.org path survives only as an explicit `--vanilla` last resort.
+
+**The general lesson:** when you replace a distro binary, rebuild it from *the
+distro's* source for that exact package version. A matching version number
+doesn't mean matching code.
 
 ---
 

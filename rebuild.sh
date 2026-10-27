@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# rebuild.sh [--build-only] [KERNELRELEASE]
+# rebuild.sh [--build-only] [--force] [--vanilla] [KERNELRELEASE]
 #
 # Builds a patched amdgpu.ko with ALL output bit-depth dithering disabled
 # (truncation + spatial + temporal/FRC), signs it with the local MOK and
@@ -10,15 +10,25 @@
 # tree  /lib/modules/$KVER/build  (KDIR). That tree carries Ubuntu's exact
 # .config, mitigation flags (CALL_PADDING/RETHUNK/…), objtool, Module.symvers
 # and kernel.release, so vermagic AND module relocations match the running
-# kernel exactly. The amdgpu source comes from the matching upstream stable
-# tarball (kernel.org); Ubuntu's HWE kernel tracks that base.
+# kernel exactly.
+#
+# Source: Ubuntu's own kernel tree from the linux-source-X.Y.Z package, in the
+# EXACT version of the installed kernel package (fetched with `apt-get
+# download`, never installed). Do NOT use the kernel.org tarball named by
+# KDIR/Makefile: Ubuntu stops bumping SUBLEVEL and keeps backporting fixes, so
+# a vanilla build silently drops them (2026-10: vanilla 7.0.14 lacked Ubuntu's
+# "fix check in amdgpu_hmm_invalidate_gfx" -> NULL deref oops -> frozen PC).
 #
 # Safe to run unattended from /etc/kernel/postinst.d/:
-#   - never touches apt/dpkg, idempotent, soft-fails (exit 0) on missing inputs,
-#   - verifies vermagic + patch marker before installing, backs up stock module.
+#   - never installs/removes packages (apt-get download needs no dpkg lock),
+#   - idempotent, soft-fails (exit 0) on missing inputs,
+#   - verifies vermagic + patch/source markers before installing, backs up
+#     the stock module.
 #
 # --build-only : compile + verify only; no signing, no install, no root needed.
 # --force      : rebuild even if the installed module already looks patched.
+# --vanilla    : last resort: build from the kernel.org tarball instead
+#                (misses Ubuntu's backported fixes — NOT recommended).
 #
 # Verification before install: vermagic, patch marker AND the
 # .gnu.linkonce.this_module relocation offsets vs the stock module (catches a
@@ -53,9 +63,10 @@ this_module_relocs() {
   printf '%s' "$out"
 }
 
-BUILD_ONLY=0; FORCE=0; KVER=""
+BUILD_ONLY=0; FORCE=0; VANILLA=0; KVER=""
 for a in "$@"; do case "$a" in
-  --build-only) BUILD_ONLY=1 ;; --force) FORCE=1 ;; *) KVER="$a" ;;
+  --build-only) BUILD_ONLY=1 ;; --force) FORCE=1 ;; --vanilla) VANILLA=1 ;;
+  -*) die "unknown option $a" ;; *) KVER="$a" ;;
 esac; done
 [ -n "$KVER" ] || KVER="$(uname -r)"
 
@@ -82,6 +93,25 @@ if grep -q '^CONFIG_GCC_PLUGIN_RANDSTRUCT=y\|^CONFIG_RANDSTRUCT_FULL=y' "$KDIR/.
   die "kernel uses RANDSTRUCT; out-of-tree amdgpu rebuild is unsafe."
 fi
 
+# --- which source? ---------------------------------------------------------
+# Ubuntu package version of this exact kernel (e.g. 7.0.0-38.38) and the
+# binary package that ships its source tree (e.g. linux-source-7.0.0).
+V=$(awk -F' *= *' '/^VERSION/{print $2}'    "$KDIR/Makefile")
+P=$(awk -F' *= *' '/^PATCHLEVEL/{print $2}' "$KDIR/Makefile")
+S=$(awk -F' *= *' '/^SUBLEVEL/{print $2}'   "$KDIR/Makefile")
+BASE="$V.$P.$S"
+PKGVER=""
+for p in "linux-modules-$KVER" "linux-image-$KVER" "linux-image-unsigned-$KVER"; do
+  PKGVER="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)" && [ -n "$PKGVER" ] && break
+done
+SRCPKG="linux-source-${KVER%%-*}"
+if [ "$VANILLA" -eq 1 ]; then
+  SRC_ID="vanilla-$BASE"
+else
+  [ -n "$PKGVER" ] || softfail "cannot determine Ubuntu package version of $KVER (dpkg-query)"
+  SRC_ID="ubuntu-$PKGVER"
+fi
+
 # --- already patched? -----------------------------------------------------
 if [ "$FORCE" -eq 0 ] && [ -f "$MODREL" ] \
    && [ "$(modinfo -F frc_dither "$MODREL" 2>/dev/null)" = "disabled" ]; then
@@ -90,40 +120,66 @@ if [ "$FORCE" -eq 0 ] && [ -f "$MODREL" ] \
   # included) and the machine falls back to simpledrm @ 1024x768.
   INST_R="$(this_module_relocs "$MODREL")"
   REF_R="$(this_module_relocs "$MODREL.stock-orig")"
+  INST_SRC="$(modinfo -F nodither_src "$MODREL" 2>/dev/null)"
   if [ -n "$INST_R" ] && [ -n "$REF_R" ] && [ "$INST_R" != "$REF_R" ]; then
     log "installed patched module has a MISMATCHED struct-module layout"
     log "  installed: $INST_R"
     log "  stock    : $REF_R"
     log "-> it cannot load on this kernel; rebuilding."
+  elif [ "$INST_SRC" != "$SRC_ID" ]; then
+    # Also catches modules from before the marker existed (= vanilla builds).
+    log "installed patched module was built from '${INST_SRC:-unknown (vanilla)}', want '$SRC_ID' -> rebuilding."
   else
-    log "amdgpu for $KVER is already patched — nothing to do."; exit 0
+    log "amdgpu for $KVER is already patched ($SRC_ID) — nothing to do."; exit 0
   fi
 fi
 
-# --- upstream base version from the kernel's own Makefile -----------------
-V=$(awk -F' *= *' '/^VERSION/{print $2}'    "$KDIR/Makefile")
-P=$(awk -F' *= *' '/^PATCHLEVEL/{print $2}' "$KDIR/Makefile")
-S=$(awk -F' *= *' '/^SUBLEVEL/{print $2}'   "$KDIR/Makefile")
-BASE="$V.$P.$S"
-log "target kernel = $KVER | upstream base = $BASE | KDIR = $KDIR"
+log "target kernel = $KVER | source = $SRC_ID | KDIR = $KDIR"
 
 # --- fetch source ---------------------------------------------------------
 mkdir -p "$WORK/src" "$WORK/build" || die "cannot create $WORK"
-TB="$WORK/src/linux-$BASE.tar.xz"
-if [ ! -s "$TB" ]; then
-  URL="https://cdn.kernel.org/pub/linux/kernel/v${V}.x/linux-$BASE.tar.xz"
-  log "downloading $URL"
-  curl -fL --retry 3 -o "$TB.part" "$URL" || softfail "source download failed"
-  mv "$TB.part" "$TB"
+if [ "$VANILLA" -eq 1 ]; then
+  log "WARNING: vanilla kernel.org source lacks Ubuntu's backported fixes."
+  TB="$WORK/src/linux-$BASE.tar.xz"
+  if [ ! -s "$TB" ]; then
+    URL="https://cdn.kernel.org/pub/linux/kernel/v${V}.x/linux-$BASE.tar.xz"
+    log "downloading $URL"
+    curl -fL --retry 3 -o "$TB.part" "$URL" || softfail "source download failed"
+    mv "$TB.part" "$TB"
+  fi
+else
+  TB="$WORK/src/$SRCPKG-$PKGVER.tar.bz2"
+  SYS_TB="/usr/src/$SRCPKG/$SRCPKG.tar.bz2"
+  if [ -s "$TB" ]; then
+    :
+  elif [ "$(dpkg-query -W -f='${Version}' "$SRCPKG" 2>/dev/null)" = "$PKGVER" ] && [ -s "$SYS_TB" ]; then
+    log "using installed $SRCPKG $PKGVER"
+    cp "$SYS_TB" "$TB.part" && mv "$TB.part" "$TB" || die "cannot copy $SYS_TB"
+  else
+    # Only downloads the .deb (no install, no dpkg lock) -> fine inside an
+    # apt transaction. A not-yet-synced mirror just soft-fails; the boot
+    # service retries later.
+    DL="$(mktemp -d "$WORK/src/dl.XXXXXX")" || die "mktemp failed"
+    [ "$(id -u)" -eq 0 ] && chown _apt "$DL" 2>/dev/null   # lets apt download sandboxed
+    log "downloading $SRCPKG=$PKGVER (~200 MB) ..."
+    ( cd "$DL" && apt-get download -q "$SRCPKG=$PKGVER" ) \
+      || { rm -rf "$DL"; softfail "apt-get download $SRCPKG=$PKGVER failed"; }
+    DEB="$(ls "$DL"/*.deb 2>/dev/null | head -n1)"
+    dpkg-deb --fsys-tarfile "$DEB" | tar -xO "./usr/src/$SRCPKG/$SRCPKG.tar.bz2" > "$TB.part" \
+      && [ -s "$TB.part" ] || { rm -rf "$DL" "$TB.part"; die "cannot unpack $SRCPKG.tar.bz2 from $DEB"; }
+    rm -rf "$DL"; mv "$TB.part" "$TB"
+  fi
 fi
 
 # Extract into a path with NO 'linux' token: the C token `linux` is a
 # predefined GCC macro (=1) and would corrupt the absolute TRACE_INCLUDE_PATH.
 BDIR="$WORK/build/$KVER"; SRC="$BDIR/ksrc"
 rm -rf "$BDIR"; mkdir -p "$BDIR"
-log "extracting ..."
+log "extracting $(basename "$TB") ..."
 tar -C "$BDIR" -xf "$TB" || die "extract failed"
-mv "$BDIR/linux-$BASE" "$SRC"
+TOP="$(find "$BDIR" -mindepth 1 -maxdepth 1 -type d)"
+[ -n "$TOP" ] && [ "$(printf '%s\n' "$TOP" | wc -l)" -eq 1 ] || die "unexpected tarball layout in $BDIR"
+mv "$TOP" "$SRC"
 cd "$SRC" || die "cannot cd $SRC"
 AMD="$SRC/drivers/gpu/drm/amd/amdgpu"
 
@@ -147,6 +203,7 @@ PY
 fi
 grep -q 'LOCAL PATCH: disable all output bit-depth reduction' "$DC" || die "dither patch did NOT apply"
 grep -q 'MODULE_INFO(frc_dither' "$DC" || printf '\n#include <linux/module.h>\nMODULE_INFO(frc_dither, "disabled");\n' >> "$DC"
+printf 'MODULE_INFO(nodither_src, "%s");\n' "$SRC_ID" >> "$DC"
 
 # Make the one absolute-path-hostile tracepoint include resolve for an
 # out-of-tree build (its default is relative to the kernel srctree).
@@ -167,6 +224,7 @@ log "built vermagic: '$BUILT_VM'"
 echo "$BUILT_VM" | grep -q modversions || die "vermagic missing modversions"
 [ -z "$STOCK_VM" ] || [ "$BUILT_VM" = "$STOCK_VM" ] || die "vermagic != stock ('$STOCK_VM')"
 [ "$(modinfo -F frc_dither "$MODOUT")" = "disabled" ] || die "marker missing in built module"
+[ "$(modinfo -F nodither_src "$MODOUT")" = "$SRC_ID" ] || die "source marker missing in built module"
 
 strip --strip-debug "$MODOUT" || die "strip failed"
 [ "$(modinfo -F frc_dither "$MODOUT")" = "disabled" ] || die "marker lost after strip"
@@ -202,7 +260,9 @@ log "signing with MOK ..."
 "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MODOUT" || die "signing failed"
 zstd -q -f -19 "$MODOUT" -o "$AMD/amdgpu.ko.zst" || die "zstd failed"
 
-if [ -f "$MODREL" ] && [ ! -f "$MODREL.stock-orig" ]; then
+# (Re)take the backup whenever the installed module is a stock one — a
+# package re-install of the same KVER must refresh a stale backup.
+if [ -f "$MODREL" ] && [ "$(modinfo -F frc_dither "$MODREL" 2>/dev/null)" != "disabled" ]; then
   cp -a "$MODREL" "$MODREL.stock-orig"; log "backed up stock -> $MODREL.stock-orig"
 fi
 install -m 0644 "$AMD/amdgpu.ko.zst" "$MODREL" || die "install failed (need root)"
@@ -210,4 +270,6 @@ depmod "$KVER" || die "depmod failed"
 update-initramfs -u -k "$KVER" >/dev/null 2>&1 || log "update-initramfs warning (non-fatal)"
 
 rm -rf "$BDIR"   # free the build tree; source tarball stays cached
-log "DONE: patched amdgpu installed for $KVER."
+# Keep only the tarball just used (each is ~200 MB).
+find "$WORK/src" -maxdepth 1 -type f ! -name "$(basename "$TB")" -delete 2>/dev/null
+log "DONE: patched amdgpu ($SRC_ID) installed for $KVER."
